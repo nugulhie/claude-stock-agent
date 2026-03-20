@@ -53,6 +53,12 @@ class StockScreener:
 
         per = price_data.get("per", 0)
         pbr = price_data.get("pbr", 0)
+
+        # 재무 API 데이터 없으면 중립값(50) 반환
+        if not financial_data:
+            reasons.append("재무데이터 없음 → 중립값 적용")
+            return 50.0, reasons, flags
+
         roe = financial_data.get("roe", 0)
         debt_ratio = financial_data.get("debt_ratio", 0)
         op_margin = financial_data.get("operating_margin", 0)

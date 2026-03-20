@@ -27,12 +27,20 @@ class KISApi:
         self.account_cd = KIS_ACCOUNT_NO.split("-")[1] if "-" in KIS_ACCOUNT_NO else "01"
         self.access_token: Optional[str] = None
         self.token_expires: Optional[datetime.datetime] = None
+        self._last_call_time: float = 0.0  # API 호출 간격 제어용
+
+    def _rate_limit(self, interval: float = 0.2):
+        """초당 5건 수준으로 보수적 간격 유지 (모의투자 서버 rate limit 대응)"""
+        elapsed = time.time() - self._last_call_time
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
+        self._last_call_time = time.time()
 
     # --------------------------------------------------
     # 인증
     # --------------------------------------------------
     def get_access_token(self) -> str:
-        """OAuth 접근 토큰 발급"""
+        """OAuth 접근 토큰 발급 (403 시 기존 토큰 재사용 또는 재시도)"""
         if self.access_token and self.token_expires and datetime.datetime.now() < self.token_expires:
             return self.access_token
 
@@ -42,13 +50,30 @@ class KISApi:
             "appkey": self.app_key,
             "appsecret": self.app_secret,
         }
-        res = requests.post(url, json=body, timeout=10)
-        res.raise_for_status()
-        data = res.json()
 
-        self.access_token = data["access_token"]
-        self.token_expires = datetime.datetime.now() + datetime.timedelta(hours=12)
-        return self.access_token
+        for attempt in range(3):
+            try:
+                res = requests.post(url, json=body, timeout=10)
+                if res.status_code == 403:
+                    # 모의투자 서버: 당일 토큰 재발급 제한 → 기존 토큰 유지
+                    if self.access_token:
+                        # 만료 시간만 연장해서 재사용
+                        self.token_expires = datetime.datetime.now() + datetime.timedelta(hours=6)
+                        return self.access_token
+                    raise requests.HTTPError(f"403 Forbidden: 토큰 발급 거부", response=res)
+                res.raise_for_status()
+                data = res.json()
+                self.access_token = data["access_token"]
+                self.token_expires = datetime.datetime.now() + datetime.timedelta(hours=12)
+                return self.access_token
+            except requests.HTTPError as e:
+                if "403" in str(e) and self.access_token:
+                    self.token_expires = datetime.datetime.now() + datetime.timedelta(hours=6)
+                    return self.access_token
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # 1s, 2s 재시도
+                else:
+                    raise
 
     def _headers(self, tr_id: str, hashkey: str = "") -> Dict[str, str]:
         """공통 헤더 생성"""
@@ -83,6 +108,7 @@ class KISApi:
         주식 현재가 조회
         Returns: {price, change, change_pct, volume, high, low, open, market_cap, per, pbr, ...}
         """
+        self._rate_limit()
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
         params = {
             "fid_cond_mrkt_div_code": "J",
@@ -116,41 +142,46 @@ class KISApi:
     def get_daily_prices(self, stock_code: str, period: str = "D",
                          count: int = 100) -> List[Dict]:
         """
-        일봉/주봉/월봉 데이터 조회
+        일봉/주봉/월봉 데이터 조회 (차트 데이터 엔드포인트 사용)
         period: D(일), W(주), M(월)
         """
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
+        self._rate_limit()
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         end_date = datetime.date.today().strftime("%Y%m%d")
-        start_date = (datetime.date.today() - datetime.timedelta(days=count * 2)).strftime("%Y%m%d")
+        # 영업일 기준 count개 확보를 위한 달력일 계산 (영업일 ≈ 달력일×5/7)
+        calendar_days = min(int(count * 1.5) + 10, 150)
+        start_date = (datetime.date.today() - datetime.timedelta(days=calendar_days)).strftime("%Y%m%d")
 
         params = {
-            "fid_cond_mrkt_div_code": "J",
-            "fid_input_iscd": stock_code,
-            "fid_input_date_1": start_date,
-            "fid_input_date_2": end_date,
-            "fid_period_div_code": period,
-            "fid_org_adj_prc": "0",  # 수정주가
+            "FID_ETC_CLS_CODE": "",
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_INPUT_DATE_1": start_date,
+            "FID_INPUT_DATE_2": end_date,
+            "FID_PERIOD_DIV_CODE": period,
+            "FID_ORG_ADJ_PRC": "0",  # 수정주가
         }
-        headers = self._headers("FHKST01010400")
+        headers = self._headers("FHKST03010100")
         res = requests.get(url, params=params, headers=headers, timeout=10)
         res.raise_for_status()
-        items = res.json().get("output", [])
+        items = res.json().get("output2", [])
 
         result = []
         for item in items[:count]:
             result.append({
                 "date": item.get("stck_bsop_date", ""),
-                "open": int(item.get("stck_oprc", 0)),
-                "high": int(item.get("stck_hgpr", 0)),
-                "low": int(item.get("stck_lwpr", 0)),
-                "close": int(item.get("stck_clpr", 0)),
-                "volume": int(item.get("acml_vol", 0)),
+                "open": int(item.get("stck_oprc", 0) or 0),
+                "high": int(item.get("stck_hgpr", 0) or 0),
+                "low": int(item.get("stck_lwpr", 0) or 0),
+                "close": int(item.get("stck_clpr", 0) or 0),
+                "volume": int(item.get("acml_vol", 0) or 0),
                 "change_pct": float(item.get("prdy_ctrt", 0) or 0),
             })
         return result
 
     def get_volume_rank(self, limit: int = 30) -> List[Dict]:
         """거래량 상위 종목 조회"""
+        self._rate_limit()
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
@@ -260,32 +291,93 @@ class KISApi:
         }
 
     # --------------------------------------------------
+    # 테마 조회
+    # --------------------------------------------------
+    def get_theme_list(self) -> List[Dict]:
+        """테마 목록 조회 (등락률 순)"""
+        try:
+            self._rate_limit()
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/theme"
+            params = {
+                "FID_COND_MRKT_CLS_CODE": "N",
+                "FID_COND_SCR_DIV_CODE": "20174",
+                "FID_RANK_SORT_CLS_CODE": "0",
+            }
+            headers = self._headers("FHKST01740000")
+            res = requests.get(url, params=params, headers=headers, timeout=10)
+            res.raise_for_status()
+            items = res.json().get("output", [])
+            result = []
+            for item in items:
+                result.append({
+                    "code": item.get("idx_cd", ""),
+                    "name": item.get("idx_kor_isnm", ""),
+                    "change_pct": float(item.get("bstp_nmix_prdy_ctrt", 0) or 0),
+                })
+            return [t for t in result if t["code"]]
+        except Exception:
+            return []
+
+    def get_theme_stocks(self, theme_code: str, limit: int = 50) -> List[Dict]:
+        """테마 내 종목 조회"""
+        try:
+            self._rate_limit()
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/theme-detail"
+            params = {
+                "FID_COND_MRKT_CLS_CODE": "N",
+                "FID_COND_SCR_DIV_CODE": "20175",
+                "FID_RANK_SORT_CLS_CODE": "0",
+                "FID_INPUT_ISCD": theme_code,
+            }
+            headers = self._headers("FHKST01740200")
+            res = requests.get(url, params=params, headers=headers, timeout=10)
+            res.raise_for_status()
+            items = res.json().get("output", [])
+            result = []
+            for item in items[:limit]:
+                code = item.get("mksc_shrn_iscd", "")
+                if code:
+                    result.append({
+                        "code": code,
+                        "name": item.get("hts_kor_isnm", ""),
+                        "change_pct": float(item.get("prdy_ctrt", 0) or 0),
+                    })
+            return result
+        except Exception:
+            return []
+
+    # --------------------------------------------------
     # 재무제표 조회
     # --------------------------------------------------
     def get_financial_data(self, stock_code: str) -> Dict:
-        """종목 재무 정보 조회"""
-        url = f"{self.base_url}/uapi/domestic-stock/v1/finance/financial-ratio"
-        params = {
-            "FID_DIV_CLS_CODE": "0",
-            "fid_cond_mrkt_div_code": "J",
-            "fid_input_iscd": stock_code,
-        }
-        headers = self._headers("FHKST66430300")
-        res = requests.get(url, params=params, headers=headers, timeout=10)
-        res.raise_for_status()
-        items = res.json().get("output", [])
+        """종목 재무 정보 조회 (실패 시 빈 딕셔너리 반환)"""
+        try:
+            self._rate_limit()
+            url = f"{self.base_url}/uapi/domestic-stock/v1/finance/financial-ratio"
+            params = {
+                "FID_DIV_CLS_CODE": "0",
+                "fid_cond_mrkt_div_code": "J",
+                "fid_input_iscd": stock_code,
+            }
+            headers = self._headers("FHKST66430300")
+            res = requests.get(url, params=params, headers=headers, timeout=10)
+            res.raise_for_status()
+            items = res.json().get("output", [])
 
-        if not items:
+            if not items:
+                return {}
+
+            latest = items[0]
+            return {
+                "code": stock_code,
+                "roe": float(latest.get("roe_val", 0) or 0),
+                "roa": float(latest.get("roa_val", 0) or 0),
+                "debt_ratio": float(latest.get("lblt_rate", 0) or 0),
+                "operating_margin": float(latest.get("bsop_prfi_inrt", 0) or 0),
+                "net_margin": float(latest.get("thtr_ntin_inrt", 0) or 0),
+                "revenue_growth": float(latest.get("sles_inrt", 0) or 0),
+                "current_ratio": float(latest.get("crnt_rate", 0) or 0),
+            }
+        except Exception:
+            # 모의투자 서버에서 재무 API 미지원 시 빈 딕셔너리 반환
             return {}
-
-        latest = items[0]
-        return {
-            "code": stock_code,
-            "roe": float(latest.get("roe_val", 0) or 0),
-            "roa": float(latest.get("roa_val", 0) or 0),
-            "debt_ratio": float(latest.get("lblt_rate", 0) or 0),
-            "operating_margin": float(latest.get("bsop_prfi_inrt", 0) or 0),
-            "net_margin": float(latest.get("thtr_ntin_inrt", 0) or 0),
-            "revenue_growth": float(latest.get("sles_inrt", 0) or 0),
-            "current_ratio": float(latest.get("crnt_rate", 0) or 0),
-        }

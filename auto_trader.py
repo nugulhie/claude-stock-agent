@@ -98,6 +98,96 @@ class AutoTrader:
         self.watchlist = list(set(self.watchlist))
         log.info(f"관심 종목 {len(self.watchlist)}개 등록")
 
+    # 테마 키워드 → 종목 코드 기본 매핑 (KIS 테마 API 미지원 시 폴백)
+    _THEME_FALLBACK: Dict[str, List[str]] = {
+        "AI":        ["000660", "005930", "035420", "034220", "010050",
+                      "030200", "036570", "122870", "240810", "950130"],
+        "반도체":    ["000660", "005930", "042700", "058470", "357780",
+                      "102110", "336370", "264450", "073640", "054040"],
+        "2차전지":   ["003670", "373220", "006400", "051910", "247540",
+                      "005070", "278280", "000270", "329180", "096770"],
+        "로봇":      ["079550", "215360", "108490", "090355", "267260",
+                      "454910", "462510", "462520", "462530", "462540"],
+        "방산":      ["012450", "047810", "064350", "272210", "071970",
+                      "003490", "086280", "008970", "018150", "082740"],
+        "원전":      ["010780", "017800", "298040", "036830", "052690",
+                      "095720", "011200", "000990", "014820", "006360"],
+        "수소":      ["009830", "095970", "383310", "286750", "187660",
+                      "012630", "009470", "267260", "003490", "011690"],
+        "바이오":    ["207940", "068270", "326030", "091990", "196170",
+                      "141080", "009420", "145020", "185750", "084990"],
+        "우주항공":  ["012450", "047810", "009570", "071970", "272210",
+                      "064350", "003490", "064960", "016600", "010140"],
+        "양자컴퓨터":["000660", "005930", "036570", "030200", "042700",
+                      "122870", "240810", "034220", "010050", "357780"],
+    }
+
+    # ==================================================
+    # 테마 후보 추출
+    # ==================================================
+
+    def _get_theme_candidates(self, volume_leaders: List[Dict]) -> List[str]:
+        """
+        거래량 상위 20개 종목에서 가장 많은 테마를 파악하고
+        해당 테마 상위 50개 종목 코드를 반환
+        """
+        vol_codes = {s["code"] for s in volume_leaders}
+        vol_names = " ".join(s.get("name", "") for s in volume_leaders)
+
+        # 1) KIS 테마 API로 현재 상위 테마 목록 조회
+        theme_list = self.kis.get_theme_list()
+
+        if theme_list:
+            # 거래량 상위 종목이 포함된 테마를 먼저 찾기
+            best_theme_code = ""
+            best_overlap = -1
+            best_change = -999.0
+
+            for theme in theme_list[:20]:  # 상위 20개 테마 대상
+                t_stocks = self.kis.get_theme_stocks(theme["code"], limit=50)
+                t_codes = {s["code"] for s in t_stocks}
+                overlap = len(vol_codes & t_codes)
+                change = theme.get("change_pct", 0)
+
+                # 겹치는 종목 수 우선, 동률이면 등락률 높은 테마
+                if overlap > best_overlap or (overlap == best_overlap and change > best_change):
+                    best_overlap = overlap
+                    best_change = change
+                    best_theme_code = theme["code"]
+                    best_theme_name = theme["name"]
+                    best_theme_stocks = t_stocks
+
+                time.sleep(0.1)
+
+            if best_theme_code and best_theme_stocks:
+                codes = [s["code"] for s in best_theme_stocks]
+                log.info(
+                    f"[테마] '{best_theme_name}' 선정 "
+                    f"(거래량 상위 겹침 {best_overlap}개, "
+                    f"등락 {best_change:+.1f}%) → {len(codes)}종목"
+                )
+                return codes
+
+        # 2) KIS 테마 API 실패 시: 거래량 상위 종목명 키워드 매칭으로 폴백
+        theme_count: Dict[str, int] = {k: 0 for k in SECTORS.theme_keywords}
+        for keyword in SECTORS.theme_keywords:
+            # 종목명 포함 여부
+            for s in volume_leaders:
+                if keyword in s.get("name", ""):
+                    theme_count[keyword] += 2
+            # 시장 개요 뉴스 포함 여부
+            if keyword in vol_names:
+                theme_count[keyword] += 1
+
+        top_theme = max(theme_count, key=lambda k: theme_count[k])
+        top_count = theme_count[top_theme]
+        codes = self._THEME_FALLBACK.get(top_theme, [])
+        log.info(
+            f"[테마] KIS API 미지원 → 키워드 폴백: '{top_theme}' "
+            f"(언급 {top_count}회) → {len(codes)}종목"
+        )
+        return codes
+
     # ==================================================
     # 핵심 매매 로직
     # ==================================================
@@ -133,7 +223,8 @@ class AutoTrader:
         # 2. 원자재 변동 데이터
         commodity_changes = self.market.get_commodity_changes()
 
-        # 3. 거래량 상위 종목 추가 탐색
+        # 3. 거래량 상위 종목 + 테마 후보 추가 탐색
+        volume_leaders = []
         try:
             volume_leaders = self.kis.get_volume_rank(limit=20)
             for stock in volume_leaders:
@@ -143,9 +234,25 @@ class AutoTrader:
         except Exception as e:
             log.warning(f"거래량 조회 실패: {e}")
 
+        # 테마 상위 50개 후보 (watchlist와 합산해 최대 100개 분석)
+        theme_codes = []
+        try:
+            theme_codes = self._get_theme_candidates(volume_leaders)
+        except Exception as e:
+            log.warning(f"테마 후보 추출 실패: {e}")
+
+        # watchlist[:50] + theme_codes[:50], 중복 제거 후 순서 유지
+        seen = set()
+        analysis_pool = []
+        for code in list(self.watchlist[:50]) + list(theme_codes[:50]):
+            if code not in seen:
+                seen.add(code)
+                analysis_pool.append(code)
+        log.info(f"분석 후보 풀: 관심종목 {min(len(self.watchlist),50)}개 + 테마 {len(theme_codes[:50])}개 = {len(analysis_pool)}개")
+
         # 4. 각 후보 분석 (상위 스코어 추출)
         candidates = []
-        for code in self.watchlist[:50]:  # 최대 50개 분석
+        for code in analysis_pool:  # 최대 100개 분석
             try:
                 signal = self._analyze_stock(code, commodity_changes)
                 if signal and signal.signal in (Signal.STRONG_BUY, Signal.BUY):
@@ -223,14 +330,31 @@ class AutoTrader:
         log.info("🔎 매수 기회 탐색 중...")
         commodity_changes = self.market.get_commodity_changes()
 
-        # 거래량 상위에서 탐색
+        # 거래량 상위 + 테마 후보에서 탐색
+        volume_leaders = []
         try:
-            volume_leaders = self.kis.get_volume_rank(limit=15)
+            volume_leaders = self.kis.get_volume_rank(limit=20)
         except Exception:
-            volume_leaders = []
+            pass
 
+        theme_codes = []
+        try:
+            theme_codes = self._get_theme_candidates(volume_leaders)
+        except Exception as e:
+            log.debug(f"테마 후보 추출 실패: {e}")
+
+        seen = set()
+        scan_pool = []
         for stock in volume_leaders:
-            code = stock["code"]
+            if stock["code"] not in seen:
+                seen.add(stock["code"])
+                scan_pool.append(stock["code"])
+        for code in theme_codes[:50]:
+            if code not in seen:
+                seen.add(code)
+                scan_pool.append(code)
+
+        for code in scan_pool:
             if code in self.portfolio.positions:
                 continue  # 이미 보유 중
 
@@ -517,9 +641,11 @@ def run_scheduler(paper_trading: bool = True):
             schedule.every().day.at(t).do(trader.monitor_positions)
 
     # 매수 기회 탐색 (30분 간격, 09:30 ~ 15:00)
-    for hour in range(9, 15):
+    for hour in range(9, 16):
         for minute in [0, 30]:
             if hour == 9 and minute < 30:
+                continue
+            if hour == 15 and minute > 0:
                 continue
             t = f"{hour:02d}:{minute:02d}"
             schedule.every().day.at(t).do(trader.scan_buy_opportunities)
