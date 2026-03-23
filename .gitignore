@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+data/auto_trader.log
+data/auto_trader_stdout.log
+data/dashboard.log
+data/dashboard_errors.log
+data/trades.json
+data/decisions.jsonl
+.DS_Store
+.venv/
+nohup.out

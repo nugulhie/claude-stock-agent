@@ -136,6 +136,11 @@ class PortfolioManager:
             return 0
 
         qty = int(available / price)
+
+        # 비율 한도 내 수량이 0이라도 현금으로 최소 1주 살 수 있으면 1주 매수
+        if qty == 0 and self.cash * 0.95 >= price:
+            qty = 1
+
         return max(0, qty)
 
     # --------------------------------------------------
