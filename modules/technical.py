@@ -350,12 +350,13 @@ class TechnicalAnalyzer:
             signal = Signal.STRONG_SELL
 
         # 목표가 / 손절가 계산
+        stop_loss = int(current_price * (1 + self.config.stop_loss_pct))  # 공통 손절가
         if signal in (Signal.STRONG_BUY, Signal.BUY):
             target_price = int(current_price * (1 + self.config.take_profit_pct))
-            stop_loss = int(current_price * (1 + self.config.stop_loss_pct))
-        else:
-            target_price = int(current_price * 0.95)  # 보수적 목표
-            stop_loss = int(current_price * (1 + self.config.stop_loss_pct))
+        elif signal == Signal.HOLD:
+            target_price = current_price  # 현재가 유지
+        else:  # SELL / STRONG_SELL
+            target_price = stop_loss  # 손절가까지 하락 예상
 
         confidence = min(100, abs(final_score - 50) * 2)
 

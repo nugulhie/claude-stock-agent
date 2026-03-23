@@ -6,6 +6,7 @@ KIS API 연동 모듈
 """
 
 import json
+import os
 import time
 import datetime
 import requests
@@ -14,6 +15,9 @@ from typing import Optional, Dict, List, Any
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import KIS_APP_KEY, KIS_APP_SECRET, KIS_ACCOUNT_NO, KIS_BASE_URL
+
+
+_TOKEN_CACHE_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "kis_token.json")
 
 
 class KISApi:
@@ -28,6 +32,31 @@ class KISApi:
         self.access_token: Optional[str] = None
         self.token_expires: Optional[datetime.datetime] = None
         self._last_call_time: float = 0.0  # API 호출 간격 제어용
+        self._load_token_cache()  # 파일에서 토큰 복원
+
+    def _load_token_cache(self):
+        """저장된 토큰 파일에서 복원"""
+        try:
+            with open(_TOKEN_CACHE_FILE, "r") as f:
+                data = json.load(f)
+            expires = datetime.datetime.fromisoformat(data["expires"])
+            if datetime.datetime.now() < expires:
+                self.access_token = data["token"]
+                self.token_expires = expires
+        except Exception:
+            pass
+
+    def _save_token_cache(self):
+        """토큰을 파일에 저장"""
+        try:
+            os.makedirs(os.path.dirname(_TOKEN_CACHE_FILE), exist_ok=True)
+            with open(_TOKEN_CACHE_FILE, "w") as f:
+                json.dump({
+                    "token": self.access_token,
+                    "expires": self.token_expires.isoformat(),
+                }, f)
+        except Exception:
+            pass
 
     def _rate_limit(self, interval: float = 0.2):
         """초당 5건 수준으로 보수적 간격 유지 (모의투자 서버 rate limit 대응)"""
@@ -55,20 +84,22 @@ class KISApi:
             try:
                 res = requests.post(url, json=body, timeout=10)
                 if res.status_code == 403:
-                    # 모의투자 서버: 당일 토큰 재발급 제한 → 기존 토큰 유지
+                    # 모의투자 서버: 당일 토큰 재발급 제한 → 파일 캐시 또는 기존 토큰 재사용
                     if self.access_token:
-                        # 만료 시간만 연장해서 재사용
                         self.token_expires = datetime.datetime.now() + datetime.timedelta(hours=6)
+                        self._save_token_cache()
                         return self.access_token
                     raise requests.HTTPError(f"403 Forbidden: 토큰 발급 거부", response=res)
                 res.raise_for_status()
                 data = res.json()
                 self.access_token = data["access_token"]
                 self.token_expires = datetime.datetime.now() + datetime.timedelta(hours=12)
+                self._save_token_cache()
                 return self.access_token
             except requests.HTTPError as e:
                 if "403" in str(e) and self.access_token:
                     self.token_expires = datetime.datetime.now() + datetime.timedelta(hours=6)
+                    self._save_token_cache()
                     return self.access_token
                 if attempt < 2:
                     time.sleep(2 ** attempt)  # 1s, 2s 재시도
