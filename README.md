@@ -29,7 +29,7 @@ kr-stock-analyzer/
 │   ├── market_data.py     # 뉴스/환율/원자재 수집
 │   ├── technical.py       # 기술적 분석 & 신호 생성기
 │   └── portfolio.py       # 포트폴리오 & 리스크 관리
-├── tests/                 # 유닛 테스트 (107개)
+├── tests/                 # 유닛 테스트
 ├── data/                  # 매매 기록, 판단 로그 (자동 생성)
 │   ├── trades.json        # 매매 기록
 │   ├── decisions.jsonl    # 매매 판단 근거 로그
@@ -94,23 +94,28 @@ export KIS_APP_KEY="발급받은_앱키"
 export KIS_APP_SECRET="발급받은_앱시크릿"
 export KIS_ACCOUNT_NO="계좌번호-상품코드"
 
-# 또는 .env 파일로 관리 (자동 로드 안 됨, 필요 시 source .env)
-echo 'export KIS_APP_KEY="..."' >> .env
-echo 'export KIS_APP_SECRET="..."' >> .env
-echo 'export KIS_ACCOUNT_NO="12345678-01"' >> .env
-source .env
+# 또는 .env 파일로 관리 (자동 로드됨)
+cat > .env << 'EOF'
+KIS_APP_KEY="발급받은_앱키"
+KIS_APP_SECRET="발급받은_앱시크릿"
+KIS_ACCOUNT_NO="12345678-01"
+KIS_TRADING_MODE="paper"
+WATCHLIST_CODES="005930,000660,373220"
+EOF
 ```
 
-### 5. 모의투자 / 실전투자 URL 전환
+### 5. 설정 점검
 
-`config.py`에서 URL을 선택합니다:
+먼저 API 키와 전략 설정을 확인합니다.
 
-```python
-# 모의투자 (먼저 이걸로 테스트!)
-KIS_BASE_URL = "https://openapivts.koreainvestment.com:29443"
+```bash
+python3 auto_trader.py --check-config
+```
 
-# 실전투자 (모의투자 검증 완료 후)
-KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
+실전 URL을 기본값으로 쓰고 싶으면 `.env`에 아래처럼 둡니다. 단, `python3 auto_trader.py --live`는 이 설정 없이도 실전 URL을 직접 사용합니다.
+
+```bash
+KIS_TRADING_MODE="live"
 ```
 
 ### 6. 동작 확인
@@ -135,9 +140,26 @@ python3 auto_trader.py
 python3 auto_trader.py --live
 ```
 
+실전 모드는 실제 주문을 전송하므로 실행 시 `LIVE` 입력 확인을 요구합니다. 서버나 `nohup`처럼 비대화형으로 실행할 때만 아래처럼 명시 확인 플래그를 붙입니다.
+
+```bash
+python3 auto_trader.py --live --yes-live
+```
+
 ### 1회 분석만
 ```bash
 python3 auto_trader.py --once
+```
+
+### 관심종목 확인
+```bash
+python3 auto_trader.py --watchlist
+```
+
+### 원하는 종목만 분석
+```bash
+python3 auto_trader.py --analyze 005930,000660
+python3 auto_trader.py --analyze 005930,000660 --json
 ```
 
 ### 대시보드
@@ -157,7 +179,8 @@ python3 -m unittest discover tests/ -v
 
 | 시간 | 작업 | 주기 |
 |------|------|------|
-| 08:30 | 장전 분석 + 상위 3개 자동 매수 | 매일 1회 |
+| 08:30 | 장전 분석 | 매일 1회 |
+| 09:05 | 장전 후보 상위 3개 자동 매수 | 매일 1회 |
 | 09:10~15:20 | 보유종목 모니터링 (손절/익절/트레일링/횡보) | 10분 |
 | 09:30~15:00 | 신규 매수 기회 탐색 | 30분 |
 | 10:00~14:00 | 보유종목 신호 재평가 (악화 시 매도) | 1시간 |

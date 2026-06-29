@@ -36,7 +36,15 @@ from modules.screener import StockScreener
 from modules.market_data import MarketDataCollector
 from modules.technical import TechnicalAnalyzer, Signal
 from modules.portfolio import PortfolioManager
-from config import STRATEGY, SECTORS
+from config import (
+    STRATEGY,
+    SECTORS,
+    KIS_BASE_URL,
+    get_config_issues,
+    get_kis_mode,
+    get_default_watchlist,
+    normalize_stock_codes,
+)
 
 # 주요 종목 코드→이름 정적 매핑 (API 호출 없이 즉시 표시)
 _STOCK_NAME_CACHE: dict = {
@@ -119,6 +127,17 @@ kis, screener, market, tech, portfolio = init_modules()
 with st.sidebar:
     st.header("⚙️ 설정")
     mode = st.selectbox("매매 모드", ["모의투자", "실전투자"])
+    kis_mode = get_kis_mode()
+    st.caption(f"KIS: {'실전' if kis_mode == 'live' else '모의'}")
+    with st.expander("설정 점검", expanded=False):
+        st.code(KIS_BASE_URL, language=None)
+        issues = get_config_issues(require_kis=False, live=(mode == "실전투자"))
+        if not issues["errors"] and not issues["warnings"]:
+            st.success("실행 가능한 설정입니다.")
+        for warning in issues["warnings"]:
+            st.warning(warning)
+        for error in issues["errors"]:
+            st.error(error)
     st.metric("초기 자본", f"{STRATEGY.initial_capital:,}원")
     st.metric("목표 금액", f"{STRATEGY.target_capital:,}원")
     st.divider()
@@ -208,15 +227,27 @@ with tab1:
 with tab2:
     st.subheader("실시간 매매 신호")
 
+    preset_options = {"기본 관심종목": get_default_watchlist()[:20]}
+    for sector, codes in SECTORS.commodity_stocks.items():
+        preset_options[f"{sector} 섹터"] = codes
+    if SECTORS.user_watchlist:
+        preset_options["사용자 관심종목"] = SECTORS.user_watchlist
+
+    selected_preset = st.selectbox("분석 프리셋", list(preset_options.keys()))
     analysis_codes = st.text_input(
         "분석할 종목 코드 (쉼표 구분)",
-        value=",".join(list(SECTORS.commodity_stocks.values())[0][:3]),
-        help="예: 005490,010950,051910"
+        value=",".join(preset_options[selected_preset]),
+        help="예: 005490,010950,051910",
+        key=f"analysis_codes_{selected_preset}",
     )
     show_code_names(analysis_codes)
 
     if st.button("🔍 신호 생성", type="primary"):
-        codes = [c.strip() for c in analysis_codes.split(",") if c.strip()]
+        codes = normalize_stock_codes(analysis_codes)
+        if not codes:
+            st.warning("분석할 6자리 종목코드를 입력하세요.")
+            st.stop()
+
         commodity_changes = market.get_commodity_changes()
 
         signals = []
@@ -254,7 +285,22 @@ with tab2:
             progress.progress((i + 1) / len(codes))
 
         if signals:
+            signal_rows = []
             for sig in sorted(signals, key=lambda s: s.confidence, reverse=True):
+                signal_rows.append({
+                    "종목코드": sig.code,
+                    "종목명": sig.name,
+                    "신호": sig.signal.value,
+                    "신뢰도": sig.confidence,
+                    "현재가": sig.price,
+                    "목표가": sig.target_price,
+                    "손절가": sig.stop_loss_price,
+                    "종합점수": sig.indicators.get("종합점수", 0),
+                    "기술점수": sig.indicators.get("기술점수", 0),
+                    "펀더멘털점수": sig.indicators.get("펀더멘털점수", 0),
+                    "원자재점수": sig.indicators.get("원자재점수", 0),
+                    "뉴스점수": sig.indicators.get("뉴스점수", 0),
+                })
                 color = {
                     Signal.STRONG_BUY: "🟢🟢",
                     Signal.BUY: "🟢",
@@ -281,6 +327,14 @@ with tab2:
                         [sig.indicators], index=["값"]
                     ).T
                     st.dataframe(indicators_df, use_container_width=True)
+
+            signal_df = pd.DataFrame(signal_rows)
+            st.download_button(
+                "분석 결과 CSV 다운로드",
+                data=signal_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"signals_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+            )
 
 
 # --------------------------------------------------
@@ -381,8 +435,13 @@ with tab5:
 
     log_path = os.path.join(os.path.dirname(__file__), "data", "trades.json")
     if os.path.exists(log_path):
-        with open(log_path, "r", encoding="utf-8") as f:
-            trades = json.load(f)
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                trades = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logging.warning(f"매매 기록 로드 실패: {e}")
+            trades = []
+            st.warning("매매 기록 파일을 읽을 수 없습니다.")
 
         if trades:
             df = pd.DataFrame(trades)
@@ -434,6 +493,7 @@ with tab6:
                 sig = r.get("signal", "")
                 if not show_all and signal_filter and sig not in signal_filter:
                     continue
+                scores = r.get("scores", {})
                 rows.append({
                     "시간": r.get("timestamp", ""),
                     "종목코드": r.get("code", ""),
@@ -441,10 +501,10 @@ with tab6:
                     "신호": sig,
                     "종합점수": round(r.get("final_score", 0), 1),
                     "신뢰도": f"{r.get('confidence', 0):.0f}%",
-                    "기술": round(r.get("scores", {}).get("technical", 0), 1),
-                    "펀더멘털": round(r.get("scores", {}).get("fundamental", 0), 1),
-                    "원자재": round(r.get("scores", {}).get("commodity", 0), 1),
-                    "뉴스": round(r.get("scores", {}).get("news", 0), 1),
+                    "기술": round(scores.get("technical", r.get("technical_score", 0)), 1),
+                    "펀더멘털": round(scores.get("fundamental", r.get("fundamental_score", 0)), 1),
+                    "원자재": round(scores.get("commodity", r.get("commodity_score", 0)), 1),
+                    "뉴스": round(scores.get("news", r.get("news_score", 0)), 1),
                     "Claude판단": r.get("claude_decision", "-") or "-",
                     "액션": r.get("action", ""),
                 })

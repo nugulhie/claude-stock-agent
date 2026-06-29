@@ -3,7 +3,16 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import unittest
-from config import StrategyConfig, SectorConfig, NewsConfig, STRATEGY, SECTORS, NEWS
+from config import (
+    StrategyConfig,
+    SectorConfig,
+    NewsConfig,
+    STRATEGY,
+    SECTORS,
+    NEWS,
+    normalize_stock_codes,
+    get_default_watchlist,
+)
 
 
 class TestStrategyConfig(unittest.TestCase):
@@ -81,6 +90,17 @@ class TestGlobalInstances(unittest.TestCase):
         self.assertIsInstance(STRATEGY, StrategyConfig)
         self.assertIsInstance(SECTORS, SectorConfig)
         self.assertIsInstance(NEWS, NewsConfig)
+
+
+class TestWatchlistHelpers(unittest.TestCase):
+    def test_normalize_stock_codes(self):
+        codes = normalize_stock_codes("5930, 000660 invalid 373220\n005930")
+        self.assertEqual(codes, ["005930", "000660", "373220"])
+
+    def test_default_watchlist_deduplicated(self):
+        codes = get_default_watchlist()
+        self.assertEqual(len(codes), len(set(codes)))
+        self.assertIn("005490", codes)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,33 @@ import os
 from dataclasses import dataclass, field
 from typing import List
 
+
+def _load_env_file(path: str = ".env"):
+    """Load simple KEY=VALUE or export KEY=VALUE lines when env vars are absent."""
+    if not os.path.exists(path):
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+_load_env_file()
+
 # ============================================================
 # KIS API 설정 (한국투자증권 Open API)
 # https://apiportal.koreainvestment.com 에서 발급
@@ -16,14 +43,42 @@ from typing import List
 KIS_APP_KEY = os.getenv("KIS_APP_KEY", "YOUR_APP_KEY")
 KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "YOUR_APP_SECRET")
 KIS_ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO", "00000000-00")  # 계좌번호-상품코드
-# KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"  # 실전투자
-KIS_BASE_URL = "https://openapivts.koreainvestment.com:29443"  # 모의투자
+KIS_PAPER_URL = "https://openapivts.koreainvestment.com:29443"
+KIS_LIVE_URL = "https://openapi.koreainvestment.com:9443"
+KIS_TRADING_MODE = os.getenv("KIS_TRADING_MODE", "paper").lower()
+KIS_BASE_URL = os.getenv(
+    "KIS_BASE_URL",
+    KIS_LIVE_URL if KIS_TRADING_MODE in {"live", "real"} else KIS_PAPER_URL,
+)
 
 # ============================================================
 # Claude API 설정 (Anthropic)
 # ============================================================
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
+
+
+def normalize_stock_codes(value) -> List[str]:
+    """쉼표/공백 구분 종목코드를 6자리 숫자 목록으로 정리."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        raw_codes = value.replace("\n", ",").replace(" ", ",").split(",")
+    else:
+        raw_codes = list(value)
+
+    codes = []
+    seen = set()
+    for raw in raw_codes:
+        code = str(raw).strip()
+        if not code:
+            continue
+        if code.isdigit():
+            code = code.zfill(6)
+        if len(code) == 6 and code.isdigit() and code not in seen:
+            seen.add(code)
+            codes.append(code)
+    return codes
 
 # ============================================================
 # 투자 전략 설정
@@ -116,6 +171,11 @@ class SectorConfig:
         "원전", "수소", "바이오", "우주항공", "양자컴퓨터"
     ])
 
+    # 사용자가 .env에서 추가하는 관심 종목
+    user_watchlist: list = field(default_factory=lambda: normalize_stock_codes(
+        os.getenv("WATCHLIST_CODES", "")
+    ))
+
 
 # ============================================================
 # 뉴스 분석 설정
@@ -144,3 +204,58 @@ POST_MARKET_REVIEW = "15:40"     # 장 마감 후 리뷰 시점
 STRATEGY = StrategyConfig()
 SECTORS = SectorConfig()
 NEWS = NewsConfig()
+
+
+def get_kis_mode() -> str:
+    """현재 KIS 접속 모드 표시용."""
+    return "live" if KIS_BASE_URL == KIS_LIVE_URL else "paper"
+
+
+def get_config_issues(require_kis: bool = False, live: bool = False) -> dict:
+    """실행 전 사용자가 바로 이해할 수 있는 설정 문제 목록."""
+    errors = []
+    warnings = []
+
+    missing_kis = []
+    if KIS_APP_KEY in {"", "YOUR_APP_KEY"}:
+        missing_kis.append("KIS_APP_KEY")
+    if KIS_APP_SECRET in {"", "YOUR_APP_SECRET"}:
+        missing_kis.append("KIS_APP_SECRET")
+    if KIS_ACCOUNT_NO in {"", "00000000-00"} or "-" not in KIS_ACCOUNT_NO:
+        missing_kis.append("KIS_ACCOUNT_NO")
+
+    if missing_kis:
+        message = "KIS 설정 필요: " + ", ".join(missing_kis)
+        if require_kis:
+            errors.append(message)
+        else:
+            warnings.append(message)
+
+    if STRATEGY.stop_loss_pct >= 0:
+        errors.append("stop_loss_pct는 음수여야 합니다.")
+    if STRATEGY.take_profit_pct <= 0:
+        errors.append("take_profit_pct는 양수여야 합니다.")
+    if not 0 < STRATEGY.max_position_pct <= 1:
+        errors.append("max_position_pct는 0~1 범위여야 합니다.")
+    if STRATEGY.min_position_pct > STRATEGY.max_position_pct:
+        errors.append("min_position_pct가 max_position_pct보다 큽니다.")
+
+    weight_total = (
+        STRATEGY.commodity_weight
+        + STRATEGY.news_weight
+        + STRATEGY.technical_weight
+        + STRATEGY.fundamental_weight
+    )
+    if abs(weight_total - 1.0) > 0.001:
+        errors.append(f"분석 가중치 합이 1.0이 아닙니다: {weight_total:.3f}")
+
+    return {"errors": errors, "warnings": warnings}
+
+
+def get_default_watchlist() -> List[str]:
+    """섹터 기본 종목과 사용자 관심종목을 중복 없이 합친 목록."""
+    codes = []
+    for sector_codes in SECTORS.commodity_stocks.values():
+        codes.extend(sector_codes)
+    codes.extend(SECTORS.user_watchlist)
+    return normalize_stock_codes(codes)

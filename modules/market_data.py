@@ -15,11 +15,12 @@ try:
     import requests
     from bs4 import BeautifulSoup
 except ImportError:
-    pass
+    requests = None
+    BeautifulSoup = None
 
 try:
     import yfinance as yf
-except ImportError:
+except Exception:
     yf = None
 
 
@@ -78,11 +79,12 @@ class MarketDataCollector:
     }
 
     def __init__(self):
-        self._session = requests.Session()
-        self._session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36"
-        })
+        self._session = requests.Session() if requests else None
+        if self._session:
+            self._session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36"
+            })
         # Claude 클라이언트 (API 키 없으면 None)
         self.claude = None
         try:
@@ -103,6 +105,9 @@ class MarketDataCollector:
             url = f"https://finance.naver.com/item/news_news.naver?code={stock_code}"
         else:
             url = "https://finance.naver.com/news/mainnews.naver"
+
+        if self._session is None or BeautifulSoup is None:
+            return news_items
 
         try:
             res = self._session.get(url, timeout=10)
@@ -234,6 +239,9 @@ class MarketDataCollector:
     def _get_exchange_rates_naver(self) -> Dict[str, Dict]:
         """네이버에서 환율 가져오기 (yfinance 대체)"""
         rates = {}
+        if self._session is None or BeautifulSoup is None:
+            return rates
+
         try:
             url = "https://finance.naver.com/marketindex/"
             res = self._session.get(url, timeout=10)

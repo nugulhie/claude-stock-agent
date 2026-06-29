@@ -135,13 +135,7 @@ class PortfolioManager:
         if available <= 0 or price <= 0:
             return 0
 
-        qty = int(available / price)
-
-        # 비율 한도 내 수량이 0이라도 현금으로 최소 1주 살 수 있으면 1주 매수
-        if qty == 0 and self.cash * 0.95 >= price:
-            qty = 1
-
-        return max(0, qty)
+        return max(0, int(available / price))
 
     # --------------------------------------------------
     # 매수 / 매도 실행
@@ -165,6 +159,9 @@ class PortfolioManager:
             pos.avg_price = (pos.avg_price * pos.qty + price * qty) / total_qty
             pos.qty = total_qty
             pos.current_price = price
+            pos.highest_price = max(pos.highest_price, price)
+            pos.stop_loss = int(pos.avg_price * (1 + self.config.stop_loss_pct))
+            pos.take_profit = int(pos.avg_price * (1 + self.config.take_profit_pct))
         else:
             self.positions[code] = Position(
                 code=code,

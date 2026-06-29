@@ -7,6 +7,7 @@ data/dashboard.log
 data/dashboard_errors.log
 data/trades.json
 data/decisions.jsonl
+data/kis_token.json
 .DS_Store
 .venv/
 nohup.out

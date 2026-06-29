@@ -54,6 +54,11 @@ class TestPositionSizing(unittest.TestCase):
         qty = self.pm.calculate_position_size(price=10000, signal_confidence=80)
         self.assertEqual(qty, 0)
 
+    def test_expensive_stock_does_not_exceed_position_cap(self):
+        """1주 가격이 최대 비중을 넘으면 매수하지 않음"""
+        qty = self.pm.calculate_position_size(price=250_000, signal_confidence=90)
+        self.assertEqual(qty, 0)
+
 
 class TestExecuteBuy(unittest.TestCase):
     def setUp(self):
@@ -91,6 +96,16 @@ class TestExecuteBuy(unittest.TestCase):
         pos = self.pm.positions["A"]
         self.assertEqual(pos.qty, 10)
         self.assertAlmostEqual(pos.avg_price, 11000)  # (10000*5 + 12000*5) / 10
+
+    def test_additional_buy_recalculates_risk_prices(self):
+        """추가 매수 후 손절/익절 기준은 새 평균단가 기준"""
+        self.pm.execute_buy("A", "종목A", 10000, 5, 70, "1차")
+        self.pm.execute_buy("A", "종목A", 20000, 5, 70, "2차")
+        pos = self.pm.positions["A"]
+        self.assertAlmostEqual(pos.avg_price, 15000)
+        self.assertEqual(pos.stop_loss, int(15000 * 0.95))
+        self.assertEqual(pos.take_profit, int(15000 * 1.15))
+        self.assertEqual(pos.highest_price, 20000)
 
     def test_stop_loss_price_set(self):
         self.pm.execute_buy("A", "종목A", 10000, 5, 70, "")

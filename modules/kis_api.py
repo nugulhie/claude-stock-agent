@@ -10,6 +10,7 @@ import os
 import time
 import datetime
 import requests
+import hashlib
 from typing import Optional, Dict, List, Any
 
 import sys, os
@@ -23,8 +24,8 @@ _TOKEN_CACHE_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "kis_t
 class KISApi:
     """한국투자증권 Open API 클라이언트"""
 
-    def __init__(self):
-        self.base_url = KIS_BASE_URL
+    def __init__(self, base_url: str = None):
+        self.base_url = base_url or KIS_BASE_URL
         self.app_key = KIS_APP_KEY
         self.app_secret = KIS_APP_SECRET
         self.account_no = KIS_ACCOUNT_NO.split("-")[0]
@@ -39,12 +40,23 @@ class KISApi:
         try:
             with open(_TOKEN_CACHE_FILE, "r") as f:
                 data = json.load(f)
+            if data.get("base_url") != self.base_url:
+                return
+            if data.get("app_key_hash") != self._hash_identifier(self.app_key):
+                return
+            if data.get("account_hash") != self._hash_identifier(self.account_no):
+                return
             expires = datetime.datetime.fromisoformat(data["expires"])
             if datetime.datetime.now() < expires:
                 self.access_token = data["token"]
                 self.token_expires = expires
         except Exception:
             pass
+
+    @staticmethod
+    def _hash_identifier(value: str) -> str:
+        """민감한 식별자를 캐시 메타데이터용 해시로 변환"""
+        return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
     def _save_token_cache(self):
         """토큰을 파일에 저장"""
@@ -54,6 +66,9 @@ class KISApi:
                 json.dump({
                     "token": self.access_token,
                     "expires": self.token_expires.isoformat(),
+                    "base_url": self.base_url,
+                    "app_key_hash": self._hash_identifier(self.app_key),
+                    "account_hash": self._hash_identifier(self.account_no),
                 }, f)
         except Exception:
             pass
@@ -122,6 +137,7 @@ class KISApi:
 
     def _get_hashkey(self, body: dict) -> str:
         """해시키 발급"""
+        self._rate_limit()
         url = f"{self.base_url}/uapi/hashkey"
         headers = {
             "content-type": "application/json; charset=utf-8",
@@ -271,15 +287,30 @@ class KISApi:
         hashkey = self._get_hashkey(body)
         headers = self._headers(tr_id, hashkey)
 
+        self._rate_limit()
         res = requests.post(url, json=body, headers=headers, timeout=10)
         res.raise_for_status()
         return res.json()
+
+    @staticmethod
+    def is_order_success(result: Dict) -> bool:
+        """KIS 주문 응답 성공 여부"""
+        return str(result.get("rt_cd", "")) == "0"
+
+    @staticmethod
+    def format_order_error(result: Dict) -> str:
+        """KIS 주문 실패 메시지 포맷"""
+        code = result.get("rt_cd", "?")
+        msg_cd = result.get("msg_cd", "")
+        msg = result.get("msg1", result)
+        return f"rt_cd={code}, msg_cd={msg_cd}, msg={msg}"
 
     # --------------------------------------------------
     # 잔고 조회
     # --------------------------------------------------
     def get_balance(self) -> Dict[str, Any]:
         """계좌 잔고 및 보유 종목 조회"""
+        self._rate_limit()
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         params = {
             "CANO": self.account_no,

@@ -10,24 +10,57 @@
 """
 
 import os
+import sys
 import time
 import json
 import logging
 import datetime
-import schedule
 from typing import List, Dict, Optional
 
-from modules.kis_api import KISApi
-from modules.screener import StockScreener
-from modules.market_data import MarketDataCollector
-from modules.technical import TechnicalAnalyzer, Signal
-from modules.portfolio import PortfolioManager, DecisionLog
-from config import STRATEGY, SECTORS
+from config import (
+    STRATEGY,
+    SECTORS,
+    KIS_BASE_URL,
+    KIS_LIVE_URL,
+    KIS_PAPER_URL,
+    get_default_watchlist,
+    get_config_issues,
+    get_kis_mode,
+    normalize_stock_codes,
+)
+
+try:
+    import schedule
+except ImportError as e:
+    schedule = None
+    SCHEDULE_IMPORT_ERROR = e
+else:
+    SCHEDULE_IMPORT_ERROR = None
+
+try:
+    from modules.kis_api import KISApi
+    from modules.screener import StockScreener
+    from modules.market_data import MarketDataCollector
+    from modules.technical import TechnicalAnalyzer, Signal
+    from modules.portfolio import PortfolioManager, DecisionLog
+except ImportError as e:
+    KISApi = None
+    StockScreener = None
+    MarketDataCollector = None
+    TechnicalAnalyzer = None
+    Signal = None
+    PortfolioManager = None
+    DecisionLog = None
+    RUNTIME_IMPORT_ERROR = e
+else:
+    RUNTIME_IMPORT_ERROR = None
 
 try:
     from modules.claude_client import ClaudeClient
 except Exception:
     ClaudeClient = None
+
+os.makedirs("data", exist_ok=True)
 
 # 로깅 설정
 logging.basicConfig(
@@ -39,6 +72,98 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("AutoTrader")
+
+
+def _effective_kis_url(live: bool = False) -> str:
+    return KIS_LIVE_URL if live else KIS_BASE_URL
+
+
+def _effective_kis_mode(live: bool = False) -> str:
+    return "live" if _effective_kis_url(live) == KIS_LIVE_URL else "paper"
+
+
+def print_config_check(require_kis: bool = False, live: bool = False) -> bool:
+    """CLI에서 바로 읽을 수 있는 설정 점검 결과 출력."""
+    issues = get_config_issues(require_kis=require_kis, live=live)
+    print("=" * 60)
+    print("설정 점검")
+    print("=" * 60)
+    print(f"KIS 모드: {_effective_kis_mode(live)} ({_effective_kis_url(live)})")
+    print(f"초기 자본: {STRATEGY.initial_capital:,}원")
+    print(f"종목당 최대 비중: {STRATEGY.max_position_pct * 100:.0f}%")
+    print(f"손절/익절: {STRATEGY.stop_loss_pct * 100:.0f}% / +{STRATEGY.take_profit_pct * 100:.0f}%")
+
+    for warning in issues["warnings"]:
+        print(f"[주의] {warning}")
+    for error in issues["errors"]:
+        print(f"[오류] {error}")
+
+    if not issues["errors"]:
+        print("결과: 실행 가능")
+        return True
+
+    print("결과: 설정 수정 필요")
+    return False
+
+
+def confirm_live_trading(yes_live: bool = False) -> bool:
+    """실전 주문 실행 전 명시 확인."""
+    if yes_live:
+        return True
+    if not sys.stdin.isatty():
+        print("실전투자는 비대화형 실행에서 --yes-live가 필요합니다.")
+        return False
+    print("실전투자 모드입니다. 실제 주문이 전송됩니다.")
+    answer = input("계속하려면 LIVE 를 입력하세요: ").strip()
+    return answer == "LIVE"
+
+
+def print_watchlist():
+    """현재 설정 기준 관심종목 출력."""
+    print("=" * 60)
+    print("관심종목")
+    print("=" * 60)
+    for sector, codes in SECTORS.commodity_stocks.items():
+        print(f"{sector}: {', '.join(codes)}")
+    if SECTORS.user_watchlist:
+        print(f"사용자 추가: {', '.join(SECTORS.user_watchlist)}")
+    print(f"전체 {len(get_default_watchlist())}개: {', '.join(get_default_watchlist())}")
+
+
+def print_signals(signals: List[object], json_output: bool = False):
+    """CLI 분석 결과 출력."""
+    if json_output:
+        payload = []
+        for signal in signals:
+            payload.append({
+                "code": signal.code,
+                "name": signal.name,
+                "signal": signal.signal.value,
+                "confidence": signal.confidence,
+                "price": signal.price,
+                "target_price": signal.target_price,
+                "stop_loss_price": signal.stop_loss_price,
+                "reasons": signal.reasons,
+                "indicators": signal.indicators,
+            })
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    if not signals:
+        print("분석 결과가 없습니다.")
+        return
+
+    for signal in signals:
+        print(f"\n{'='*50}")
+        print(f"종목: {signal.name} ({signal.code})")
+        print(f"신호: {signal.signal.value} (신뢰도: {signal.confidence:.0f}%)")
+        print(f"현재가: {signal.price:,}원")
+        print(f"목표가: {signal.target_price:,}원")
+        print(f"손절가: {signal.stop_loss_price:,}원")
+        print("근거:")
+        for reason in signal.reasons[:8]:
+            print(f"  - {reason}")
+        print(f"지표: {json.dumps(signal.indicators, ensure_ascii=False, indent=2)}")
 
 
 class AutoTrader:
@@ -62,8 +187,15 @@ class AutoTrader:
         paper_trading=True: 모의투자 (실제 주문 X, 시뮬레이션)
         paper_trading=False: 실전투자 (실제 주문 실행)
         """
+        if RUNTIME_IMPORT_ERROR:
+            raise RuntimeError(
+                "필수 의존성이 설치되지 않았습니다. "
+                "먼저 `pip install -r requirements.txt`를 실행하세요. "
+                f"원인: {RUNTIME_IMPORT_ERROR}"
+            )
+
         self.paper_trading = paper_trading
-        self.kis = KISApi()
+        self.kis = KISApi(base_url=KIS_PAPER_URL if paper_trading else KIS_LIVE_URL)
         self.screener = StockScreener(self.kis)
         self.market = MarketDataCollector()
         self.tech = TechnicalAnalyzer()
@@ -91,12 +223,22 @@ class AutoTrader:
 
     def _build_watchlist(self):
         """관심 종목 리스트 구성"""
-        # 원자재 관련주 추가
-        for sector, codes in SECTORS.commodity_stocks.items():
-            self.watchlist.extend(codes)
-        # 중복 제거
-        self.watchlist = list(set(self.watchlist))
+        self.watchlist = get_default_watchlist()
         log.info(f"관심 종목 {len(self.watchlist)}개 등록")
+
+    def analyze_codes(self, codes: List[str]) -> List[object]:
+        """지정 종목만 분석해서 신뢰도순으로 반환."""
+        commodity_changes = self.market.get_commodity_changes()
+        signals = []
+        for code in normalize_stock_codes(codes):
+            try:
+                signal = self._analyze_stock(code, commodity_changes)
+                if signal:
+                    signals.append(signal)
+                time.sleep(0.2)
+            except Exception as e:
+                log.warning(f"{code} 분석 실패: {e}")
+        return sorted(signals, key=lambda s: s.confidence, reverse=True)
 
     # 테마 키워드 → 종목 코드 기본 매핑 (KIS 테마 API 미지원 시 폴백)
     _THEME_FALLBACK: Dict[str, List[str]] = {
@@ -181,6 +323,9 @@ class AutoTrader:
 
         top_theme = max(theme_count, key=lambda k: theme_count[k])
         top_count = theme_count[top_theme]
+        if top_count <= 0:
+            log.info("[테마] 거래량/테마 단서 없음 → 테마 후보 없음")
+            return []
         codes = self._THEME_FALLBACK.get(top_theme, [])
         log.info(
             f"[테마] KIS API 미지원 → 키워드 폴백: '{top_theme}' "
@@ -355,6 +500,10 @@ class AutoTrader:
                 scan_pool.append(code)
 
         for code in scan_pool:
+            if len(self.portfolio.positions) >= STRATEGY.max_positions:
+                log.info("최대 보유 종목 수 도달 - 남은 매수 후보 스킵")
+                break
+
             if code in self.portfolio.positions:
                 continue  # 이미 보유 중
 
@@ -571,13 +720,16 @@ class AutoTrader:
             # 실전: KIS API로 주문
             try:
                 result = self.kis.place_order(signal.code, qty, side="buy")
-                self.portfolio.execute_buy(
-                    code=signal.code, name=signal.name,
-                    price=signal.price, qty=qty,
-                    signal_score=signal.confidence,
-                    reason="; ".join(signal.reasons[:3]),
-                )
-                log.info(f"  📗 [실전] 매수 {signal.name} {qty}주 @ {signal.price:,}원")
+                if self.kis.is_order_success(result):
+                    self.portfolio.execute_buy(
+                        code=signal.code, name=signal.name,
+                        price=signal.price, qty=qty,
+                        signal_score=signal.confidence,
+                        reason="; ".join(signal.reasons[:3]),
+                    )
+                    log.info(f"  📗 [실전] 매수 {signal.name} {qty}주 @ {signal.price:,}원")
+                else:
+                    log.error(f"  매수 주문 거절: {self.kis.format_order_error(result)}")
             except Exception as e:
                 log.error(f"  매수 주문 실패: {e}")
 
@@ -594,8 +746,11 @@ class AutoTrader:
         else:
             try:
                 result = self.kis.place_order(code, pos.qty, side="sell")
-                self.portfolio.execute_sell(code, price, reason=reason)
-                log.info(f"  📕 [실전] 매도 {pos.name} {pos.qty}주 @ {price:,}원 ({reason})")
+                if self.kis.is_order_success(result):
+                    self.portfolio.execute_sell(code, price, reason=reason)
+                    log.info(f"  📕 [실전] 매도 {pos.name} {pos.qty}주 @ {price:,}원 ({reason})")
+                else:
+                    log.error(f"  매도 주문 거절: {self.kis.format_order_error(result)}")
             except Exception as e:
                 log.error(f"  매도 주문 실패: {e}")
 
@@ -614,14 +769,28 @@ def run_scheduler(paper_trading: bool = True):
     - 09:30~15:00 (30분 간격) 신규 매수 기회 탐색
     - 15:40 일일 리포트
     """
+    if schedule is None:
+        raise RuntimeError(
+            "schedule 패키지가 설치되지 않았습니다. "
+            "먼저 `pip install -r requirements.txt`를 실행하세요. "
+            f"원인: {SCHEDULE_IMPORT_ERROR}"
+        )
+
     os.makedirs("data", exist_ok=True)
 
     trader = AutoTrader(paper_trading=paper_trading)
     log.info("🚀 자동매매 스케줄러 시작")
 
+    morning_candidates = []
+
     def morning_analysis():
-        """장 시작 전 분석 + 초기 매수"""
-        candidates = trader.pre_market_analysis()
+        """장 시작 전 분석"""
+        nonlocal morning_candidates
+        morning_candidates = trader.pre_market_analysis()
+
+    def initial_buy():
+        """장 시작 후 장전 후보 초기 매수"""
+        candidates = morning_candidates or trader.pre_market_analysis()
         # 상위 3개 자동 매수
         for signal in candidates[:3]:
             if len(trader.portfolio.positions) < STRATEGY.max_positions:
@@ -629,6 +798,7 @@ def run_scheduler(paper_trading: bool = True):
 
     # 스케줄 등록
     schedule.every().day.at("08:30").do(morning_analysis)
+    schedule.every().day.at("09:05").do(initial_buy)
 
     # 보유종목 모니터링 (10분 간격, 09:10 ~ 15:20)
     for hour in range(9, 16):
@@ -658,7 +828,8 @@ def run_scheduler(paper_trading: bool = True):
     schedule.every().day.at("15:40").do(trader.post_market_review)
 
     log.info("📅 스케줄 등록 완료:")
-    log.info("  08:30 - 장 시작 전 분석 + 매수")
+    log.info("  08:30 - 장 시작 전 분석")
+    log.info("  09:05 - 장전 후보 상위 3개 매수")
     log.info("  09:10~15:20 (10분) - 보유종목 모니터링 (손절/익절/트레일링/횡보)")
     log.info("  09:30~15:00 (30분) - 매수 기회 탐색")
     log.info("  10:00~14:00 (1시간) - 보유종목 신호 재평가")
@@ -685,22 +856,48 @@ if __name__ == "__main__":
     os.makedirs("data", exist_ok=True)
     parser = argparse.ArgumentParser(description="한국 주식 자동매매")
     parser.add_argument("--live", action="store_true", help="실전투자 모드 (기본: 모의투자)")
+    parser.add_argument("--yes-live", action="store_true", help="실전투자 확인 프롬프트 생략")
     parser.add_argument("--once", action="store_true", help="1회 분석만 실행")
+    parser.add_argument("--watchlist", action="store_true", help="현재 관심종목 목록 출력 후 종료")
+    parser.add_argument("--analyze", metavar="CODES", help="쉼표 구분 종목코드만 분석 후 종료")
+    parser.add_argument("--json", action="store_true", help="--analyze/--once 결과를 JSON으로 출력")
+    parser.add_argument("--check-config", action="store_true", help="API 키/전략 설정만 점검 후 종료")
     args = parser.parse_args()
 
-    if args.once:
+    if args.check_config:
+        ok = print_config_check(require_kis=False, live=args.live)
+        sys.exit(0 if ok else 1)
+
+    if args.watchlist:
+        print_watchlist()
+        sys.exit(0)
+
+    if args.json and (args.analyze or args.once):
+        issues = get_config_issues(require_kis=True, live=args.live)
+        if issues["errors"]:
+            for error in issues["errors"]:
+                print(f"[오류] {error}", file=sys.stderr)
+            sys.exit(1)
+    elif not print_config_check(require_kis=True, live=args.live):
+        sys.exit(1)
+
+    if RUNTIME_IMPORT_ERROR:
+        print("필수 의존성이 설치되지 않았습니다.")
+        print("해결: pip install -r requirements.txt")
+        print(f"원인: {RUNTIME_IMPORT_ERROR}")
+        sys.exit(1)
+
+    if args.live and not confirm_live_trading(args.yes_live):
+        print("실전투자 실행을 취소했습니다.")
+        sys.exit(1)
+
+    if args.analyze:
+        trader = AutoTrader(paper_trading=not args.live)
+        signals = trader.analyze_codes(normalize_stock_codes(args.analyze))
+        print_signals(signals, json_output=args.json)
+    elif args.once:
         trader = AutoTrader(paper_trading=not args.live)
         candidates = trader.pre_market_analysis()
-        for signal in candidates[:5]:
-            print(f"\n{'='*50}")
-            print(f"종목: {signal.name} ({signal.code})")
-            print(f"신호: {signal.signal.value} (신뢰도: {signal.confidence:.0f}%)")
-            print(f"현재가: {signal.price:,}원")
-            print(f"목표가: {signal.target_price:,}원")
-            print(f"손절가: {signal.stop_loss_price:,}원")
-            print(f"근거:")
-            for r in signal.reasons:
-                print(f"  - {r}")
-            print(f"지표: {json.dumps(signal.indicators, ensure_ascii=False, indent=2)}")
+        print_signals(candidates[:5], json_output=args.json)
     else:
         run_scheduler(paper_trading=not args.live)
